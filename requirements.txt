@@ -2,6 +2,7 @@ streamlit
 langchain
 langchain-community
 langchain-google-genai
+langchain-text-splitters
 google-generativeai
 pypdf
 docx2txt==0.8
