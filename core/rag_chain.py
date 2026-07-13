@@ -1,6 +1,7 @@
 """
 Builds the conversational retrieval (RAG) chain: Gemini chat model + vector
-retriever + conversation memory, and formats answers with source citations.
+retriever + lightweight conversation memory, and formats answers with source
+citations.
 
 NOTE ON CHAT MODEL NAMES (as of mid-2026):
 Google periodically restricts older/preview chat models (e.g. "gemini-1.5-pro",
@@ -13,9 +14,6 @@ it's the safest default for new accounts. Pin an explicit version (e.g.
 """
 from dataclasses import dataclass, field
 
-from langchain.chains import ConversationalRetrievalChain
-from langchain.memory import ConversationBufferMemory
-from langchain.prompts import PromptTemplate
 from langchain_google_genai import ChatGoogleGenerativeAI
 
 from config.settings import settings
@@ -50,6 +48,45 @@ class RagResult:
     sources: list[str] = field(default_factory=list)
 
 
+class SimpleMemory:
+    def __init__(self) -> None:
+        self.messages: list[tuple[str, str]] = []
+
+    def add(self, role: str, content: str) -> None:
+        self.messages.append((role, content))
+        self.messages = self.messages[-10:]
+
+    def clear(self) -> None:
+        self.messages = []
+
+    def format(self) -> str:
+        if not self.messages:
+            return "No previous conversation."
+        return "\n".join(f"{role}: {content}" for role, content in self.messages)
+
+
+class SimpleRagChain:
+    def __init__(self, llm: ChatGoogleGenerativeAI, retriever, memory: SimpleMemory) -> None:
+        self.llm = llm
+        self.retriever = retriever
+        self.memory = memory
+
+    def invoke(self, inputs: dict[str, str]) -> dict:
+        question = inputs["question"]
+        source_docs = self.retriever.invoke(question)
+        context = "\n\n".join(doc.page_content for doc in source_docs)
+        prompt = SYSTEM_PROMPT.format(
+            context=context,
+            chat_history=self.memory.format(),
+            question=question,
+        )
+        response = self.llm.invoke(prompt)
+        answer = getattr(response, "content", str(response)).strip()
+        self.memory.add("user", question)
+        self.memory.add("assistant", answer)
+        return {"answer": answer, "source_documents": source_docs}
+
+
 def _normalize_chat_model_name(raw_name: str | None) -> str:
     """Strip stray whitespace/quotes from the configured chat model name."""
     name = (raw_name or "").strip().strip('"').strip("'").strip()
@@ -63,7 +100,6 @@ def _build_llm() -> ChatGoogleGenerativeAI:
             model=model_name,
             google_api_key=settings.GOOGLE_API_KEY,
             temperature=settings.TEMPERATURE,
-            convert_system_message_to_human=True,
         )
     except Exception as exc:  # noqa: BLE001
         raise RuntimeError(
@@ -74,39 +110,21 @@ def _build_llm() -> ChatGoogleGenerativeAI:
         ) from exc
 
 
-def build_memory() -> ConversationBufferMemory:
-    return ConversationBufferMemory(
-        memory_key="chat_history",
-        return_messages=True,
-        output_key="answer",
-    )
+def build_memory() -> SimpleMemory:
+    return SimpleMemory()
 
 
-def build_rag_chain(vector_store, memory: ConversationBufferMemory) -> ConversationalRetrievalChain:
-    """Build a ConversationalRetrievalChain wired up with Gemini, retrieval, and memory."""
+def build_rag_chain(vector_store, memory: SimpleMemory) -> SimpleRagChain:
+    """Build a small RAG chain wired up with Gemini, retrieval, and memory."""
     llm = _build_llm()
-
     retriever = vector_store.as_retriever(
         search_type="similarity",
         search_kwargs={"k": settings.RETRIEVER_TOP_K},
     )
-
-    prompt = PromptTemplate(
-        template=SYSTEM_PROMPT,
-        input_variables=["context", "chat_history", "question"],
-    )
-
-    chain = ConversationalRetrievalChain.from_llm(
-        llm=llm,
-        retriever=retriever,
-        memory=memory,
-        return_source_documents=True,
-        combine_docs_chain_kwargs={"prompt": prompt},
-    )
-    return chain
+    return SimpleRagChain(llm=llm, retriever=retriever, memory=memory)
 
 
-def ask_question(chain: ConversationalRetrievalChain, question: str) -> RagResult:
+def ask_question(chain: SimpleRagChain, question: str) -> RagResult:
     """Run a question through the chain and return the answer plus source citations."""
     result = chain.invoke({"question": question})
 
