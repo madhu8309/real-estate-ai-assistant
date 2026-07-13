@@ -1,5 +1,5 @@
 """
-Builds, saves, loads, and updates the FAISS vector store using Google
+Builds, saves, loads, and updates a lightweight local vector store using Google
 Generative AI embeddings.
 
 NOTE ON MODEL NAMES (as of mid-2026):
@@ -23,16 +23,19 @@ backoff (honoring the server's suggested retry_delay when present) if a
 429 slips through anyway.
 """
 import re
+import pickle
+import math
 import time
 from pathlib import Path
+from typing import Any
 
-from langchain_community.vectorstores import FAISS
 from langchain_google_genai import GoogleGenerativeAIEmbeddings
 from langchain_core.documents import Document
+from langchain_core.retrievers import BaseRetriever
 
 from config.settings import settings
 
-_INDEX_NAME = "faiss_index"
+_INDEX_NAME = "local_index.pkl"
 
 # Safe fallback if GEMINI_EMBEDDING_MODEL is unset in .env.
 _DEFAULT_EMBEDDING_MODEL = "models/gemini-embedding-2"
@@ -45,6 +48,78 @@ _MAX_RETRIES_PER_BATCH = 6
 _BASE_BACKOFF_SECONDS = 5.0
 
 _RETRY_DELAY_RE = re.compile(r"retry_delay\s*\{\s*seconds:\s*(\d+)")
+
+
+def _cosine_similarity(left: list[float], right: list[float]) -> float:
+    dot = sum(a * b for a, b in zip(left, right))
+    left_norm = math.sqrt(sum(a * a for a in left))
+    right_norm = math.sqrt(sum(b * b for b in right))
+    if left_norm == 0 or right_norm == 0:
+        return 0.0
+    return dot / (left_norm * right_norm)
+
+
+class LocalVectorStore:
+    """Tiny persisted vector store that avoids native FAISS dependencies."""
+
+    def __init__(
+        self,
+        embeddings: GoogleGenerativeAIEmbeddings,
+        documents: list[Document],
+        vectors: list[list[float]],
+    ) -> None:
+        self.embeddings = embeddings
+        self.documents = documents
+        self.vectors = vectors
+
+    def as_retriever(self, search_type: str = "similarity", search_kwargs: dict[str, Any] | None = None):
+        if search_type != "similarity":
+            raise ValueError("LocalVectorStore only supports similarity search.")
+        k = (search_kwargs or {}).get("k", settings.RETRIEVER_TOP_K)
+        return LocalVectorStoreRetriever(vector_store=self, k=k)
+
+    def similarity_search(self, query: str, k: int) -> list[Document]:
+        query_vector = self.embeddings.embed_query(query)
+        scored = [
+            (_cosine_similarity(query_vector, vector), document)
+            for vector, document in zip(self.vectors, self.documents)
+        ]
+        scored.sort(key=lambda item: item[0], reverse=True)
+        return [document for _, document in scored[:k]]
+
+    def save_local(self, vectorstore_dir: Path) -> None:
+        vectorstore_dir.mkdir(parents=True, exist_ok=True)
+        with (vectorstore_dir / _INDEX_NAME).open("wb") as file:
+            pickle.dump(
+                {"documents": self.documents, "vectors": self.vectors},
+                file,
+                protocol=pickle.HIGHEST_PROTOCOL,
+            )
+
+    @classmethod
+    def load_local(
+        cls,
+        vectorstore_dir: Path,
+        embeddings: GoogleGenerativeAIEmbeddings,
+    ) -> "LocalVectorStore":
+        with (vectorstore_dir / _INDEX_NAME).open("rb") as file:
+            payload = pickle.load(file)
+        return cls(
+            embeddings=embeddings,
+            documents=payload["documents"],
+            vectors=payload["vectors"],
+        )
+
+
+class LocalVectorStoreRetriever(BaseRetriever):
+    vector_store: Any
+    k: int = 4
+
+    class Config:
+        arbitrary_types_allowed = True
+
+    def _get_relevant_documents(self, query: str, *, run_manager=None) -> list[Document]:
+        return self.vector_store.similarity_search(query, self.k)
 
 
 def _normalize_embedding_model_name(raw_name: str | None) -> str:
@@ -148,13 +223,11 @@ def _embed_chunks_in_batches(
 
 def index_exists(vectorstore_dir: Path | None = None) -> bool:
     vectorstore_dir = vectorstore_dir or settings.VECTORSTORE_DIR
-    index_path = vectorstore_dir / f"{_INDEX_NAME}.faiss"
-    pkl_path = vectorstore_dir / f"{_INDEX_NAME}.pkl"
-    return index_path.exists() and pkl_path.exists()
+    return (vectorstore_dir / _INDEX_NAME).exists()
 
 
-def build_vector_store(chunks: list[Document], vectorstore_dir: Path | None = None) -> FAISS:
-    """Build a fresh FAISS index from document chunks and persist it to disk."""
+def build_vector_store(chunks: list[Document], vectorstore_dir: Path | None = None) -> LocalVectorStore:
+    """Build a fresh local index from document chunks and persist it to disk."""
     if not chunks:
         raise ValueError(
             "No document chunks to index. Add PDF/DOCX files to the data directory first."
@@ -178,28 +251,28 @@ def build_vector_store(chunks: list[Document], vectorstore_dir: Path | None = No
             "in your .env to 'models/gemini-embedding-2'."
         ) from exc
 
-    vector_store = FAISS.from_embeddings(text_embedding_pairs, embedding=embeddings, metadatas=metadatas)
-    vector_store.save_local(str(vectorstore_dir), index_name=_INDEX_NAME)
+    vectors = [vector for _, vector in text_embedding_pairs]
+    documents = [
+        Document(page_content=chunk.page_content, metadata=metadata)
+        for chunk, metadata in zip(chunks, metadatas)
+    ]
+    vector_store = LocalVectorStore(embeddings=embeddings, documents=documents, vectors=vectors)
+    vector_store.save_local(vectorstore_dir)
     return vector_store
 
 
-def load_vector_store(vectorstore_dir: Path | None = None) -> FAISS:
-    """Load a previously persisted FAISS index from disk."""
+def load_vector_store(vectorstore_dir: Path | None = None) -> LocalVectorStore:
+    """Load a previously persisted local index from disk."""
     vectorstore_dir = vectorstore_dir or settings.VECTORSTORE_DIR
     embeddings = get_embeddings()
-    return FAISS.load_local(
-        str(vectorstore_dir),
-        embeddings,
-        index_name=_INDEX_NAME,
-        allow_dangerous_deserialization=True,  # safe: we only ever load files we wrote ourselves
-    )
+    return LocalVectorStore.load_local(vectorstore_dir, embeddings)
 
 
 def get_or_build_vector_store(
     chunks: list[Document] | None = None,
     vectorstore_dir: Path | None = None,
     force_rebuild: bool = False,
-) -> FAISS:
+) -> LocalVectorStore:
     """Load the index if it exists, otherwise build it from the given chunks."""
     vectorstore_dir = vectorstore_dir or settings.VECTORSTORE_DIR
 
@@ -212,8 +285,12 @@ def get_or_build_vector_store(
     return build_vector_store(chunks, vectorstore_dir)
 
 
-def add_documents(vector_store: FAISS, chunks: list[Document], vectorstore_dir: Path | None = None) -> FAISS:
-    """Add new chunks to an existing FAISS index and persist the update."""
+def add_documents(
+    vector_store: LocalVectorStore,
+    chunks: list[Document],
+    vectorstore_dir: Path | None = None,
+) -> LocalVectorStore:
+    """Add new chunks to an existing local index and persist the update."""
     vectorstore_dir = vectorstore_dir or settings.VECTORSTORE_DIR
 
     embeddings = get_embeddings()
@@ -226,6 +303,10 @@ def add_documents(vector_store: FAISS, chunks: list[Document], vectorstore_dir: 
             f"Error embedding content with model '{embeddings.model}': {exc}"
         ) from exc
 
-    vector_store.add_embeddings(text_embedding_pairs, metadatas=metadatas)
-    vector_store.save_local(str(vectorstore_dir), index_name=_INDEX_NAME)
+    vector_store.documents.extend(
+        Document(page_content=chunk.page_content, metadata=metadata)
+        for chunk, metadata in zip(chunks, metadatas)
+    )
+    vector_store.vectors.extend(vector for _, vector in text_embedding_pairs)
+    vector_store.save_local(vectorstore_dir)
     return vector_store

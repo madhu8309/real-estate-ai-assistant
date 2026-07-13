@@ -1,5 +1,5 @@
 """
-Builds the conversational retrieval (RAG) chain: Gemini chat model + FAISS
+Builds the conversational retrieval (RAG) chain: Gemini chat model + vector
 retriever + conversation memory, and formats answers with source citations.
 
 NOTE ON CHAT MODEL NAMES (as of mid-2026):
@@ -16,7 +16,6 @@ from dataclasses import dataclass, field
 from langchain.chains import ConversationalRetrievalChain
 from langchain.memory import ConversationBufferMemory
 from langchain.prompts import PromptTemplate
-from langchain_community.vectorstores import FAISS
 from langchain_google_genai import ChatGoogleGenerativeAI
 
 from config.settings import settings
@@ -83,8 +82,8 @@ def build_memory() -> ConversationBufferMemory:
     )
 
 
-def build_rag_chain(vector_store: FAISS, memory: ConversationBufferMemory) -> ConversationalRetrievalChain:
-    """Build a ConversationalRetrievalChain wired up with Gemini, FAISS, and memory."""
+def build_rag_chain(vector_store, memory: ConversationBufferMemory) -> ConversationalRetrievalChain:
+    """Build a ConversationalRetrievalChain wired up with Gemini, retrieval, and memory."""
     llm = _build_llm()
 
     retriever = vector_store.as_retriever(
