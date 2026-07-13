@@ -1,0 +1,3 @@
+FAISS index files (faiss_index.faiss / faiss_index.pkl) are generated here
+at runtime and are gitignored. Do not commit them — they are rebuilt from
+the source documents in data/documents/.
